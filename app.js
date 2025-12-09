@@ -525,16 +525,20 @@ function renderTasks(filter = "undated") {
     actions.appendChild(postponeBtn);
 
     const urgencyBadge = document.createElement("span");
-    urgencyBadge.className = "badge";
-    if (task.urgency) {
-      urgencyBadge.classList.add(`badge-urgency-${task.urgency}`);
-      const map = {
-        today: "היום",
-        week: "השבוע",
-        month: "החודש",
-        none: "לא דחוף"
-      };
-      urgencyBadge.textContent = map[task.urgency] || [task.urgency];
+urgencyBadge.className = "badge";
+
+if (task.urgency) {
+  urgencyBadge.classList.add(`badge-urgency-${task.urgency}`);
+  const map = {
+    today: "היום",
+    week: "השבוע",
+    month: "החודש",
+    none: "לא דחוף"
+  };
+  urgencyBadge.textContent =
+    map[task.urgency] || task.urgency;
+}
+
    {
 
     item.appendChild(header);
