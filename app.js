@@ -539,7 +539,7 @@ if (task.urgency) {
     map[task.urgency] || task.urgency;
 }
 
-   {
+  
 
     item.appendChild(header);
     item.appendChild(meta);
