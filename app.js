@@ -15,6 +15,7 @@ import {
 
 import { db } from "./firebase-config.js";
 
+// --- STATE ---
 const state = {
   currentUser: "binyamin",
   currentDate: new Date(),
@@ -25,10 +26,10 @@ const state = {
     cityTz: null
   },
   cache: {
-    events: {}, // key: dateKey -> {id: event}
+    events: {},
     tasks: {},
     shopping: {},
-    holidays: {}, // dateKey -> holiday info
+    holidays: {},
     holidaysLoadedYear: null,
     shabbat: {}
   },
@@ -42,6 +43,7 @@ const el = (id) => document.getElementById(id);
 const qs = (sel, root = document) => root.querySelector(sel);
 const qsa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+// --- DATE HELPERS ---
 function dateKeyFromDate(date) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
@@ -54,6 +56,7 @@ function parseDateKey(key) {
   return new Date(y, m - 1, d);
 }
 
+// ✔️ תיקון סוגריים + פונקציות עברית תקינות לחלוטין
 function formatHebrewDate(date) {
   try {
     const hd = new Hebcal.HDate(date);
@@ -61,7 +64,7 @@ function formatHebrewDate(date) {
   } catch (e) {
     return "";
   }
-
+}
 
 function formatHebrewDayLetters(date) {
   try {
@@ -73,15 +76,12 @@ function formatHebrewDayLetters(date) {
     return "";
   }
 }
-}
 
 function getHebrewMonthYearLabel(date) {
   try {
     const hd = new Hebcal.HDate(date);
     const parts = hd.toString("h").split(" ");
-    if (parts.length >= 2) {
-      return parts.slice(1).join(" ");
-    }
+    if (parts.length >= 2) return parts.slice(1).join(" ");
     return hd.toString("h");
   } catch (e) {
     return "";
@@ -92,39 +92,39 @@ function getCity() {
   return state.settings.city || "ירושלים";
 }
 
-// --- Open-Meteo helpers (מזג אוויר בלי API KEY) ---
+// --- WEATHER: Open-Meteo ---
 async function geocodeCity(name) {
   const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
     name
   )}&count=1&language=he&format=json`;
+
   const resp = await fetch(url);
   const data = await resp.json();
+
   if (!data.results || !data.results.length) throw new Error("עיר לא נמצאה");
+
   const r = data.results[0];
   state.settings.cityLat = r.latitude;
   state.settings.cityLon = r.longitude;
   state.settings.cityTz = r.timezone;
-  // לאחסן בריל-טיים
+
   try {
     const settingsRef = ref(db, "settings");
     update(settingsRef, {
-      cityLat: state.settings.cityLat,
-      cityLon: state.settings.cityLon,
-      cityTz: state.settings.cityTz
+      cityLat: r.latitude,
+      cityLon: r.longitude,
+      cityTz: r.timezone
     });
-  } catch (e) {
-    console.warn("Failed saving city coords", e);
-  }
+  } catch (e) {}
 }
 
 async function ensureCityCoords() {
   if (state.settings.cityLat && state.settings.cityLon && state.settings.cityTz) return;
-  const city = getCity();
-  await geocodeCity(city);
+  await geocodeCity(getCity());
 }
 
+// מפה של קוד → אימוג'י + תיאור
 function mapOpenMeteoWeather(code) {
-  // קודים לפי Open-Meteo
   if (code === 0) return { label: "שמים בהירים", emoji: "☀️" };
   if ([1, 2, 3].includes(code)) return { label: "מעונן חלקית", emoji: "🌤️" };
   if ([45, 48].includes(code)) return { label: "ערפל", emoji: "🌫️" };
@@ -136,368 +136,322 @@ function mapOpenMeteoWeather(code) {
   return { label: "מזג אוויר", emoji: "🌦️" };
 }
 
+// --- HOLIDAYS ---
 function hebrewHolidayForDate(date) {
   try {
-    const events = Hebcal.holidays(date, { il: true });
-    if (!events || !events.length) return null;
-    const e = events[0];
+    const ev = Hebcal.holidays(date, { il: true });
+    if (!ev || !ev.length) return null;
+    const e = ev[0];
     return e.render ? e.render("he") : e.desc || null;
   } catch (e) {
     return null;
   }
 }
 
-function isSameDay(d1, d2) {
-  return (
-    d1.getFullYear() === d2.getFullYear() &&
-    d1.getMonth() === d2.getMonth() &&
-    d1.getDate() === d2.getDate()
-  );
+function ensureYearHolidays(year) {
+  if (state.cache.holidaysLoadedYear === year) return;
+
+  state.cache.holidaysLoadedYear = year;
+
+  const start = new Date(year, 0, 1);
+  const end = new Date(year, 11, 31);
+
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const k = dateKeyFromDate(d);
+    const name = hebrewHolidayForDate(new Date(d));
+    if (name) state.cache.holidays[k] = { name };
+  }
 }
 
+// --- Shabbat ---
+function isFriday(date) {
+  return date.getDay() === 5;
+}
 function isShabbat(date) {
   return date.getDay() === 6;
 }
 
-function isFriday(date) {
-  return date.getDay() === 5;
-}
+async function ensureShabbatForWeek(friday) {
+  const key = dateKeyFromDate(friday);
 
-function dayName(date) {
-  const names = ["א'", "ב'", "ג'", "ד'", "ה'", "ו'", "ש'"];
-  return names[date.getDay()];
-}
+  if (state.cache.shabbat[key]) return state.cache.shabbat[key];
+  if (!state.settings.cityLat || !state.settings.cityLon) return null;
 
-// --- זמני שבת – cache לפי יום שישי ---
-async function ensureShabbatForWeek(fridayDate) {
-  const fridayKey = dateKeyFromDate(fridayDate);
-  if (state.cache.shabbat[fridayKey]) return state.cache.shabbat[fridayKey];
+  const y = friday.getFullYear();
+  const m = String(friday.getMonth() + 1).padStart(2, "0");
+  const d = String(friday.getDate()).padStart(2, "0");
 
-  if (!state.settings.cityLat || !state.settings.cityLon || !state.settings.cityTz) {
-    return null;
-  }
-
-  const y = fridayDate.getFullYear();
-  const m = String(fridayDate.getMonth() + 1).padStart(2, "0");
-  const d = String(fridayDate.getDate()).padStart(2, "0");
-  const url = `https://www.hebcal.com/shabbat?cfg=json&latitude=${
-    state.settings.cityLat
-  }&longitude=${state.settings.cityLon}&tzid=${encodeURIComponent(
-    state.settings.cityTz
+  const url = `https://www.hebcal.com/shabbat?cfg=json&latitude=${state.settings.cityLat}&longitude=${state.settings.cityLon}&tzid=${encodeURIComponent(
+    state.settings.cityTz || "Asia/Jerusalem"
   )}&start=${y}-${m}-${d}&end=${y}-${m}-${d}`;
 
   try {
     const resp = await fetch(url);
     const data = await resp.json();
-    const itemCandles = (data.items || []).find((it) => it.category === "candles");
-    const itemHavdalah = (data.items || []).find((it) => it.category === "havdalah");
-    const result = {
-      candle: itemCandles ? new Date(itemCandles.date) : null,
-      havdalah: itemHavdalah ? new Date(itemHavdalah.date) : null
+
+    const candles = (data.items || []).find((i) => i.category === "candles");
+    const havdalah = (data.items || []).find((i) => i.category === "havdalah");
+
+    const val = {
+      candle: candles ? new Date(candles.date) : null,
+      havdalah: havdalah ? new Date(havdalah.date) : null
     };
-    state.cache.shabbat[fridayKey] = result;
-    return result;
+
+    state.cache.shabbat[key] = val;
+    return val;
   } catch (e) {
-    console.error("Failed loading shabbat times", e);
+    console.error("Shabbat fetch failed", e);
     return null;
   }
 }
 
-function formatTimeHM(date) {
-  if (!date) return "";
-  const h = String(date.getHours()).padStart(2, "0");
-  const m = String(date.getMinutes()).padStart(2, "0");
-  return `${h}:${m}`;
+function formatTimeHM(d) {
+  if (!d) return "";
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-function ensureYearHolidays(year) {
-  if (state.cache.holidaysLoadedYear === year) return;
-  state.cache.holidaysLoadedYear = year;
-  const start = new Date(year, 0, 1);
-  const end = new Date(year, 11, 31);
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    const key = dateKeyFromDate(d);
-    const name = hebrewHolidayForDate(new Date(d));
-    if (name) {
-      state.cache.holidays[key] = { name };
-    }
-  }
-}
-
-// ---------- דיבור + הומור של ג'יחרי ----------
-
+// --- GIHARI VOICE & HUMOR ---
 let gihariVoice = null;
 
 function loadVoices() {
   if (!("speechSynthesis" in window)) return;
   const voices = speechSynthesis.getVoices();
   gihariVoice =
-    voices.find(
-      (v) =>
-        v.lang === "he-IL" &&
-        (v.name.includes("Google") ||
-          v.name.toLowerCase().includes("wavenet") ||
-          v.name.toLowerCase().includes("enhanced"))
-    ) ||
+    voices.find((v) => v.lang === "he-IL" && v.name.includes("Google")) ||
     voices.find((v) => v.lang === "he-IL") ||
     voices[0] ||
     null;
 }
-
 if ("speechSynthesis" in window) {
   window.speechSynthesis.onvoiceschanged = loadVoices;
 }
 
 function gihariSpeak(text) {
   if (!("speechSynthesis" in window)) return;
-  if (!text) return;
-  const utter = new SpeechSynthesisUtterance(text);
-  utter.lang = "he-IL";
-  utter.rate = 1.03;
-  utter.pitch = 1.0;
-  if (gihariVoice) utter.voice = gihariVoice;
-  speechSynthesis.speak(utter);
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "he-IL";
+  u.rate = 1.05;
+  if (gihariVoice) u.voice = gihariVoice;
+  speechSynthesis.speak(u);
 }
 
-// מצב D – הכל: רגוע, צחוקים, עקיצות, חכם – רנדומלי בכל תשובה
 function wrapGihariHumor(html) {
-  const plain = html.replace(/<[^>]+>/g, "").trim();
-
-  const chill = [
-    "סגור אחי, עליי. 😎",
-    "לגמרי, מטפל בזה בשקט. 🧘‍♂️",
-    "קיבלתי, ממשיך לעבוד ברקע. 😉"
-  ];
+  const clean = html.replace(/<[^>]+>/g, "");
   const jokes = [
-    "אם זה לא יעבוד, תקלל אותי בצדק. 😂",
-    "אני עובד פה שעות, ואתה רק נותן הוראות. 🤖",
-    "שנייה, בודק… אל תספר לאף אחד שאני יותר מסודר ממך. 🤫"
+    "יאללה גבר, סידרתי לך את זה. 😎",
+    "עובד על זה כמו עבד יא מלך 🤣",
+    "שנייה, מחדד את המוח… 🧠",
+    "חכה חכה… אני יותר חכם ממך 😉"
   ];
-  const roast = [
-    "וואלה בלי העזרה שלי היית הולך לאיבוד ביומן. 🔥",
-    "אתה יודע שאתה מבקש ממני לעשות דברים שאתה לא תזכור בכלל שביקשת. 😏",
-    "הפעם אני מסדר, בפעם הבאה תביא גם בורקס. 😜"
-  ];
-  const smart = [
-    "לוגיסטית זו הייתה בקשה חכמה, אני מאשר. 📊",
-    "התאמתי את זה ככה שיישב יפה בין העומס שלך. 🧠",
-    "שיקללתי דחיפות, עומס ומשך – ויצא מושלם. 💡"
-  ];
+  const line = jokes[Math.floor(Math.random() * jokes.length)];
+  return line + "<br>" + html;
+}
 
-  const families = [chill, jokes, roast, smart];
-  const fam = families[Math.floor(Math.random() * families.length)];
-  const line = fam[Math.floor(Math.random() * fam.length)];
-
-  return `${line}<br>${html}`;
+// --- CALENDAR RENDER ---
+function isSameDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
 }
 
 function renderCalendar() {
   const grid = el("calendarGrid");
   grid.innerHTML = "";
 
-  const currentMonthDate = state.currentDate;
-  const year = currentMonthDate.getFullYear();
-  const month = currentMonthDate.getMonth();
+  const d0 = state.currentDate;
+  const y = d0.getFullYear();
+  const m = d0.getMonth();
 
-  ensureYearHolidays(year);
+  ensureYearHolidays(y);
 
-  const firstDayOfMonth = new Date(year, month, 1);
-  // תיקון הסטייה – תחילת שבוע באותו מקום כמו בגרסה שעבדה לך
-  const startDay = (firstDayOfMonth.getDay() + 1) % 7;
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const first = new Date(y, m, 1);
+  const days = new Date(y, m + 1, 0).getDate();
 
-  let gregLabel = firstDayOfMonth.toLocaleDateString("he-IL", {
+  el("gregMonthLabel").textContent = first.toLocaleDateString("he-IL", {
     month: "long",
     year: "numeric"
   });
-  el("gregMonthLabel").textContent = gregLabel;
-  el("hebrewMonthLabel").textContent = getHebrewMonthYearLabel(firstDayOfMonth) || "";
+  el("hebrewMonthLabel").textContent = getHebrewMonthYearLabel(first);
 
-  const prevMonthDays = new Date(year, month, 0).getDate();
+  const startDay = (first.getDay() + 1) % 7;
+  const prevDays = new Date(y, m, 0).getDate();
 
   const today = new Date();
 
-  const totalCells = 42;
-  for (let cellIndex = 0; cellIndex < totalCells; cellIndex++) {
+  for (let i = 0; i < 42; i++) {
     const cell = document.createElement("button");
-    cell.type = "button";
     cell.className = "day-cell";
 
     let dayNum;
-    let cellDate;
+    let d;
     let outside = false;
 
-    if (cellIndex < startDay) {
-      dayNum = prevMonthDays - startDay + cellIndex + 1;
-      cellDate = new Date(year, month - 1, dayNum);
+    if (i < startDay) {
+      dayNum = prevDays - startDay + i + 1;
+      d = new Date(y, m - 1, dayNum);
       outside = true;
-    } else if (cellIndex >= startDay + daysInMonth) {
-      dayNum = cellIndex - startDay - daysInMonth + 1;
-      cellDate = new Date(year, month + 1, dayNum);
+    } else if (i >= startDay + days) {
+      dayNum = i - startDay - days + 1;
+      d = new Date(y, m + 1, dayNum);
       outside = true;
     } else {
-      dayNum = cellIndex - startDay + 1;
-      cellDate = new Date(year, month, dayNum);
+      dayNum = i - startDay + 1;
+      d = new Date(y, m, dayNum);
     }
 
-    const dateKey = dateKeyFromDate(cellDate);
-    const heb = formatHebrewDayLetters(cellDate);
-    const holiday = state.cache.holidays[dateKey];
-    const events = state.cache.events[dateKey] || {};
+    const dk = dateKeyFromDate(d);
 
-    const header = document.createElement("div");
-    header.className = "day-header";
+    // HEADER
+    const head = document.createElement("div");
+    head.className = "day-header";
 
-    const dayNumEl = document.createElement("div");
-    dayNumEl.className = "day-num";
-    dayNumEl.textContent = dayNum;
+    const dn = document.createElement("div");
+    dn.className = "day-num";
+    dn.textContent = dayNum;
 
-    const hebEl = document.createElement("div");
-    hebEl.className = "day-hebrew";
-    hebEl.textContent = heb;
+    const dh = document.createElement("div");
+    dh.className = "day-hebrew";
+    dh.textContent = formatHebrewDayLetters(d);
 
-    header.appendChild(dayNumEl);
-    header.appendChild(hebEl);
-    cell.appendChild(header);
+    head.appendChild(dn);
+    head.appendChild(dh);
+    cell.appendChild(head);
 
-    if (holiday) {
-      const holidayEl = document.createElement("div");
-      holidayEl.className = "day-holiday";
-      holidayEl.textContent = holiday.name;
-      cell.appendChild(holidayEl);
+    // HOLIDAY
+    if (state.cache.holidays[dk]) {
+      const h = document.createElement("div");
+      h.className = "day-holiday";
+      h.textContent = state.cache.holidays[dk].name;
+      cell.appendChild(h);
     }
 
-    // ערב שבת ושבת – עם זמני הדלקה/צאת שבת
-    let shabbatLabel = null;
-    let fridayForTimes = null;
-    if (isFriday(cellDate)) {
-      shabbatLabel = "🕯️ ערב שבת";
-      fridayForTimes = new Date(cellDate);
-    } else if (isShabbat(cellDate)) {
-      shabbatLabel = "✨ שבת";
-      fridayForTimes = new Date(cellDate);
-      fridayForTimes.setDate(fridayForTimes.getDate() - 1);
+    // SHABBAT
+    let shLabel = null;
+    let fri = null;
+
+    if (isFriday(d)) {
+      shLabel = "🕯️ ערב שבת";
+      fri = new Date(d);
+    } else if (isShabbat(d)) {
+      shLabel = "✨ שבת";
+      fri = new Date(d);
+      fri.setDate(fri.getDate() - 1);
     }
 
-    if (shabbatLabel && fridayForTimes) {
-      const shabbatWrap = document.createElement("div");
-      shabbatWrap.className = "day-shabbat-block";
+    if (shLabel && fri) {
+      const wrap = document.createElement("div");
+      wrap.className = "day-shabbat-block";
 
-      const line1 = document.createElement("div");
-      line1.className = "day-shabbat-title";
-      line1.textContent = shabbatLabel;
-      shabbatWrap.appendChild(line1);
+      const t1 = document.createElement("div");
+      t1.className = "day-shabbat-title";
+      t1.textContent = shLabel;
 
-      const line2 = document.createElement("div");
-      line2.className = "day-shabbat-time";
-      line2.textContent = "טוען זמני שבת...";
-      shabbatWrap.appendChild(line2);
+      const t2 = document.createElement("div");
+      t2.className = "day-shabbat-time";
+      t2.textContent = "טוען…";
 
-      cell.appendChild(shabbatWrap);
+      wrap.appendChild(t1);
+      wrap.appendChild(t2);
+      cell.appendChild(wrap);
 
-      ensureShabbatForWeek(fridayForTimes).then((info) => {
+      ensureShabbatForWeek(fri).then((info) => {
         if (!info) {
-          line2.textContent = "";
+          t2.textContent = "";
           return;
         }
-        if (isFriday(cellDate) && info.candle) {
-          line2.textContent = "כניסת שבת: " + formatTimeHM(info.candle);
-        } else if (isShabbat(cellDate) && info.havdalah) {
-          line2.textContent = "צאת שבת: " + formatTimeHM(info.havdalah);
+        if (isFriday(d) && info.candle) {
+          t2.textContent = "כניסת שבת: " + formatTimeHM(info.candle);
+        } else if (isShabbat(d) && info.havdalah) {
+          t2.textContent = "צאת שבת: " + formatTimeHM(info.havdalah);
         } else {
-          line2.textContent = "";
+          t2.textContent = "";
         }
       });
     }
 
-    const pointsRow = document.createElement("div");
-    pointsRow.className = "day-points";
+    // EVENTS DOTS
+    const events = state.cache.events[dk] || {};
+    let count = 0;
+    const row = document.createElement("div");
+    row.className = "day-points";
 
-    let eventCount = 0;
     Object.values(events).forEach((ev) => {
       const dot = document.createElement("div");
       dot.className = "event-dot";
       if (ev.type === "task") dot.classList.add("task");
       if (ev.owner) dot.classList.add(`owner-${ev.owner}`);
-      pointsRow.appendChild(dot);
-      eventCount++;
+      row.appendChild(dot);
+      count++;
     });
 
-    if (eventCount > 0) {
-      cell.appendChild(pointsRow);
-    }
+    if (count > 0) cell.appendChild(row);
+    if (count >= 2) cell.classList.add("day-border-glow");
+    if (outside) cell.classList.add("outside");
+    if (isSameDay(d, today)) cell.classList.add("day-cell-today");
 
-    if (eventCount >= 2) {
-      cell.classList.add("day-border-glow");
-    }
-
-    if (outside) {
-      cell.classList.add("outside");
-    }
-
-    if (isSameDay(cellDate, today)) {
-      cell.classList.add("day-cell-today");
-    }
-
-    cell.addEventListener("click", () => openDayModal(cellDate));
+    cell.addEventListener("click", () => openDayModal(d));
 
     grid.appendChild(cell);
   }
 }
 
+// --- TASKS ---
 function renderTasks(filter = "undated") {
   const list = el("tasksList");
   list.innerHTML = "";
-  const allTasks = [];
 
-  Object.entries(state.cache.events).forEach(([dateKey, items]) => {
+  const all = [];
+
+  Object.entries(state.cache.events).forEach(([dk, items]) => {
     Object.entries(items).forEach(([id, ev]) => {
-      if (ev.type !== "task") return;
-      allTasks.push({ id, dateKey, ...ev });
+      if (ev.type === "task") all.push({ id, dateKey: dk, ...ev });
     });
   });
 
-  allTasks.sort((a, b) => {
+  all.sort((a, b) => {
     if (!a.dateKey && b.dateKey) return -1;
     if (a.dateKey && !b.dateKey) return 1;
     if (a.dateKey && b.dateKey) return a.dateKey.localeCompare(b.dateKey);
     return 0;
   });
 
-  const filtered = allTasks.filter((task) => {
-    const hasDate = !!task.dateKey && task.dateKey !== "undated";
-    const isRecurring = task.recurring && task.recurring !== "none";
-    if (filter === "undated") return !hasDate;
-    if (filter === "dated") return hasDate && !isRecurring;
-    if (filter === "recurring") return isRecurring;
+  const filtered = all.filter((t) => {
+    const has = !!t.dateKey && t.dateKey !== "undated";
+    const rec = t.recurring && t.recurring !== "none";
+    if (filter === "undated") return !has;
+    if (filter === "dated") return has && !rec;
+    if (filter === "recurring") return rec;
     return true;
   });
 
-  filtered.forEach((task) => {
+  filtered.forEach((t) => {
     const item = document.createElement("div");
     item.className = "task-item";
 
-    const header = document.createElement("div");
-    header.className = "task-item-header";
+    const head = document.createElement("div");
+    head.className = "task-item-header";
 
     const title = document.createElement("div");
     title.className = "task-title";
-    title.textContent = task.title;
+    title.textContent = t.title;
 
-    const ownerBadge = document.createElement("span");
-    ownerBadge.className = "badge";
-    ownerBadge.textContent =
-      task.owner === "shared" ? "משותף" : task.owner === "binyamin" ? "בנימין" : "ננה";
-    ownerBadge.classList.add(`badge-owner-${task.owner}`);
+    const ob = document.createElement("span");
+    ob.className = "badge";
+    ob.textContent =
+      t.owner === "shared" ? "משותף" : t.owner === "binyamin" ? "בנימין" : "ננה";
+    ob.classList.add(`badge-owner-${t.owner}`);
 
-    header.appendChild(title);
-    header.appendChild(ownerBadge);
+    head.appendChild(title);
+    head.appendChild(ob);
 
     const meta = document.createElement("div");
     meta.className = "task-meta";
+
     const parts = [];
-    if (task.dateKey && task.dateKey !== "undated") {
-      const d = parseDateKey(task.dateKey);
+    if (t.dateKey && t.dateKey !== "undated") {
+      const d = parseDateKey(t.dateKey);
       parts.push(
         d.toLocaleDateString("he-IL", {
           weekday: "short",
@@ -508,135 +462,135 @@ function renderTasks(filter = "undated") {
     } else {
       parts.push("ללא תאריך");
     }
-    if (task.duration) parts.push(`${task.duration} דק'`);
-    if (task.urgency) {
+
+    if (t.duration) parts.push(`${t.duration} דק'`);
+
+    if (t.urgency) {
       const map = {
         today: "היום",
         week: "השבוע",
         month: "החודש",
         none: "לא דחוף"
       };
-      parts.push(`דחיפות: ${map[task.urgency] || task.urgency}`);
+      meta.textContent = parts.join(" • ");
+      const b = document.createElement("span");
+      b.className = "badge";
+      b.classList.add(`badge-urgency-${t.urgency}`);
+      b.textContent = map[t.urgency] || t.urgency;
+      item.appendChild(head);
+      item.appendChild(meta);
+      item.appendChild(b);
+    } else {
+      meta.textContent = parts.join(" • ");
+      item.appendChild(head);
+      item.appendChild(meta);
     }
-    meta.textContent = parts.join(" • ");
-
-    const actions = document.createElement("div");
-    actions.className = "task-actions";
-
-    const doneBtn = document.createElement("button");
-    doneBtn.className = "ghost-pill small";
-    doneBtn.textContent = "✔ בוצע";
-    doneBtn.addEventListener("click", () => markTaskDone(task));
-
-    const postponeBtn = document.createElement("button");
-    postponeBtn.className = "ghost-pill small";
-    postponeBtn.textContent = "דחיה";
-    postponeBtn.addEventListener("click", () => postponeTask(task));
-
-    actions.appendChild(doneBtn);
-    actions.appendChild(postponeBtn);
-
-    const urgencyBadge = document.createElement("span");
-    urgencyBadge.className = "badge";
-    if (task.urgency) {
-      urgencyBadge.classList.add(`badge-urgency-${task.urgency}`);
-      const map = {
-        today: "היום",
-        week: "השבוע",
-        month: "החודש",
-        none: "לא דחוף"
-      };
-      urgencyBadge.textContent = map[task.urgency] || task.urgency;
-    }
-
-    item.appendChild(header);
-    item.appendChild(meta);
-    item.appendChild(actions);
-    if (task.urgency) item.appendChild(urgencyBadge);
 
     list.appendChild(item);
   });
 }
 
-function markTaskDone(task) {
-  const refPath = ref(db, `events/${task.dateKey}/${task.id}`);
-  remove(refPath);
-}
+// --- AUTO BLOCKS ---
+function renderAutoBlocks(date) {
+  const box = el("dayAutoBlocks");
+  box.innerHTML = "";
 
-function postponeTask(task) {
-  const baseDate = task.dateKey && task.dateKey !== "undated" ? parseDateKey(task.dateKey) : new Date();
-  const newDate = new Date(baseDate);
+  const blocks = [];
+  const day = date.getDay();
+  const dk = dateKeyFromDate(date);
 
-  if (task.urgency === "today") {
-    newDate.setDate(newDate.getDate() + 1);
-  } else if (task.urgency === "week") {
-    newDate.setDate(newDate.getDate() + 3);
-  } else if (task.urgency === "month") {
-    newDate.setDate(newDate.getDate() + 7);
-  } else {
-    newDate.setDate(newDate.getDate() + 1);
+  blocks.push({ label: "שינה", range: "00:00–08:00", type: "sleep" });
+
+  if (day >= 0 && day <= 4) {
+    blocks.push({ label: "עבודה", range: "08:00–17:00", type: "work" });
+    blocks.push({ label: "אוכל + מקלחת", range: "17:00–18:30", type: "meal" });
   }
 
-  const newKey = dateKeyFromDate(newDate);
-  const fromRef = ref(db, `events/${task.dateKey}/${task.id}`);
-  const newRef = ref(db, `events/${newKey}/${task.id}`);
+  const autoRef = ref(db, `days/${dk}/holiday`);
+  onValue(
+    autoRef,
+    (snap) => {
+      const isH = !!snap.val();
+      box.innerHTML = "";
+      const finals = [];
 
-  set(newRef, {
-    ...task,
-    dateKey: newKey
-  });
-  remove(fromRef);
+      if (isH) {
+        finals.push({
+          label: "יום חופש",
+          range: "ללא עבודה/ארוחות",
+          type: "holiday"
+        });
+      } else {
+        finals.push(...blocks);
+      }
+
+      finals.forEach((b) => {
+        const row = document.createElement("div");
+        row.className = "auto-block";
+        if (b.type === "holiday") row.classList.add("auto-holiday");
+
+        const la = document.createElement("div");
+        la.className = "auto-block-label";
+        la.textContent = b.label;
+
+        const ra = document.createElement("div");
+        ra.className = "auto-block-range";
+        ra.textContent = b.range;
+
+        row.appendChild(la);
+        row.appendChild(ra);
+        box.appendChild(row);
+      });
+    },
+    { onlyOnce: true }
+  );
 }
 
+// --- DAY MODAL ---
 function openDayModal(date) {
   const modal = el("dayModal");
   modal.classList.remove("hidden");
 
-  const gregLabel = date.toLocaleDateString("he-IL", {
+  el("dayModalGreg").textContent = date.toLocaleDateString("he-IL", {
     weekday: "long",
     day: "2-digit",
     month: "2-digit",
     year: "numeric"
   });
-  el("dayModalGreg").textContent = gregLabel;
+
   el("dayModalHeb").textContent = formatHebrewDate(date);
 
-  const dateKey = dateKeyFromDate(date);
-  renderDayEvents(dateKey);
+  const dk = dateKeyFromDate(date);
+
+  renderDayEvents(dk);
   renderAutoBlocks(date);
 
   const weatherCard = el("dayWeatherContainer");
-  if (!hasEventsOnDate(dateKey)) {
+  if (!hasEventsOnDate(dk)) {
     fetchWeatherForDate(date, true);
   } else {
     weatherCard.classList.add("hidden");
   }
 
-  el("btnAddFromDay").onclick = () => {
-    openEditModal({ dateKey });
-  };
+  el("btnAddFromDay").onclick = () => openEditModal({ dateKey: dk });
+  el("btnToggleDayWeather").onclick = () => fetchWeatherForDate(date, false);
 
-  el("btnToggleDayWeather").onclick = () => {
-    fetchWeatherForDate(date, false);
-  };
-
-  qsa("[data-close-modal]", modal).forEach((btn) => {
-    btn.onclick = () => modal.classList.add("hidden");
+  qsa("[data-close-modal]", modal).forEach((b) => {
+    b.onclick = () => modal.classList.add("hidden");
   });
   qs(".modal-backdrop", modal).onclick = () => modal.classList.add("hidden");
 }
 
-function hasEventsOnDate(dateKey) {
-  const events = state.cache.events[dateKey] || {};
-  return Object.keys(events).length > 0;
+function hasEventsOnDate(k) {
+  return Object.keys(state.cache.events[k] || {}).length > 0;
 }
 
-function renderDayEvents(dateKey) {
-  const container = el("dayEventsContainer");
-  container.innerHTML = "";
-  const events = state.cache.events[dateKey] || {};
+// --- RENDER EVENTS FOR DAY ---
+function renderDayEvents(dk) {
+  const box = el("dayEventsContainer");
+  box.innerHTML = "";
 
-  const list = Object.entries(events)
+  const list = Object.entries(state.cache.events[dk] || {})
     .map(([id, ev]) => ({ id, ...ev }))
     .sort((a, b) => {
       if (!a.startTime && b.startTime) return 1;
@@ -650,175 +604,101 @@ function renderDayEvents(dateKey) {
     card.className = "card";
     if (ev.owner) card.classList.add(`owner-${ev.owner}`);
 
-    const header = document.createElement("div");
-    header.className = "task-item-header";
+    const head = document.createElement("div");
+    head.className = "task-item-header";
 
     const title = document.createElement("div");
     title.className = "task-title";
     title.textContent = ev.title;
 
-    const ownerBadge = document.createElement("span");
-    ownerBadge.className = "badge";
-    ownerBadge.classList.add(`badge-owner-${ev.owner}`);
-    ownerBadge.textContent =
+    const ob = document.createElement("span");
+    ob.className = "badge";
+    ob.classList.add(`badge-owner-${ev.owner}`);
+    ob.textContent =
       ev.owner === "shared" ? "משותף" : ev.owner === "binyamin" ? "בנימין" : "ננה";
 
-    header.appendChild(title);
-    header.appendChild(ownerBadge);
+    head.appendChild(title);
+    head.appendChild(ob);
 
     const meta = document.createElement("div");
     meta.className = "task-meta";
+
     const parts = [];
-    if (ev.startTime) {
-      parts.push(`${ev.startTime}${ev.endTime ? `–${ev.endTime}` : ""}`);
-    }
+    if (ev.startTime) parts.push(`${ev.startTime}${ev.endTime ? `–${ev.endTime}` : ""}`);
     if (ev.duration) parts.push(`${ev.duration} דק'`);
-    if (ev.type === "task") parts.push("משימה");
-    else parts.push("אירוע");
+    parts.push(ev.type === "task" ? "משימה" : "אירוע");
+
     meta.textContent = parts.join(" • ");
 
     const desc = document.createElement("div");
     desc.className = "task-meta";
     desc.textContent = ev.description || "";
 
-    const wazeBtn = document.createElement("button");
-    wazeBtn.className = "ghost-pill small";
-    wazeBtn.textContent = "Waze";
-    if (ev.address) {
-      wazeBtn.onclick = () => {
-        const url = `https://waze.com/ul?q=${encodeURIComponent(ev.address)}`;
-        window.open(url, "_blank");
-      };
-    } else {
-      wazeBtn.disabled = true;
-    }
-
-    const actions = document.createElement("div");
-    actions.className = "task-actions";
+    const act = document.createElement("div");
+    act.className = "task-actions";
 
     const editBtn = document.createElement("button");
     editBtn.className = "ghost-pill small";
     editBtn.textContent = "עריכה";
-    editBtn.onclick = () => openEditModal({ dateKey, id: ev.id || ev._id });
+    editBtn.onclick = () => openEditModal({ dateKey: dk, id: ev.id || ev._id });
 
     const delBtn = document.createElement("button");
     delBtn.className = "ghost-pill small";
     delBtn.textContent = "מחיקה";
     delBtn.onclick = () => {
-      const refPath = ref(db, `events/${dateKey}/${ev.id || ev._id}`);
+      const refPath = ref(db, `events/${dk}/${ev.id || ev._id}`);
       remove(refPath);
     };
 
-    actions.appendChild(editBtn);
-    actions.appendChild(delBtn);
-    actions.appendChild(wazeBtn);
+    const wazeBtn = document.createElement("button");
+    wazeBtn.className = "ghost-pill small";
+    wazeBtn.textContent = "Waze";
+    if (ev.address) {
+      wazeBtn.onclick = () => {
+        window.open(`https://waze.com/ul?q=${encodeURIComponent(ev.address)}`, "_blank");
+      };
+    } else {
+      wazeBtn.disabled = true;
+    }
 
-    card.appendChild(header);
+    act.appendChild(editBtn);
+    act.appendChild(delBtn);
+    act.appendChild(wazeBtn);
+
+    card.appendChild(head);
     card.appendChild(meta);
     if (ev.description) card.appendChild(desc);
-    card.appendChild(actions);
-
-    container.appendChild(card);
+    card.appendChild(act);
+    box.appendChild(card);
   });
 }
 
-function renderAutoBlocks(date) {
-  const container = el("dayAutoBlocks");
-  container.innerHTML = "";
-
-  const blocks = [];
-
-  const day = date.getDay();
-  const dateKey = dateKeyFromDate(date);
-
-  blocks.push({
-    label: "שינה",
-    range: "00:00–08:00",
-    type: "sleep"
-  });
-
-  if (day >= 0 && day <= 4) {
-    blocks.push({
-      label: "עבודה",
-      range: "08:00–17:00",
-      type: "work"
-    });
-    blocks.push({
-      label: "אוכל + מקלחת",
-      range: "17:00–18:30",
-      type: "meal"
-    });
-  }
-
-  const autoHolidayRef = ref(db, `days/${dateKey}/holiday`);
-  onValue(
-    autoHolidayRef,
-    (snap) => {
-      const isHolidayMarked = !!snap.val();
-      container.innerHTML = "";
-      const finalBlocks = [...blocks];
-
-      if (isHolidayMarked) {
-        finalBlocks.length = 0;
-        finalBlocks.push({
-          label: "יום חופש",
-          range: "ללא עבודה, אוכל/מקלחת אוטומטיים",
-          type: "holiday"
-        });
-      }
-
-      finalBlocks.forEach((b) => {
-        const row = document.createElement("div");
-        row.className = "auto-block";
-        if (b.type === "holiday") row.classList.add("auto-holiday");
-
-        const label = document.createElement("div");
-        label.className = "auto-block-label";
-        label.textContent = b.label;
-
-        const range = document.createElement("div");
-        range.className = "auto-block-range";
-        range.textContent = b.range;
-
-        row.appendChild(label);
-        row.appendChild(range);
-        container.appendChild(row);
-      });
-    },
-    { onlyOnce: true }
-  );
-}
-
+// --- EDIT MODAL ---
 function openEditModal({ dateKey, id } = {}) {
   const modal = el("editModal");
   modal.classList.remove("hidden");
+
   const form = el("editForm");
   form.reset();
 
-  const dateInput = form.elements["date"];
-  if (dateKey) {
-    dateInput.value = dateKey;
-  } else {
-    dateInput.value = dateKeyFromDate(state.currentDate);
-  }
+  form.elements["date"].value = dateKey || dateKeyFromDate(state.currentDate);
 
   form.dataset.editDateKey = dateKey || "";
   form.dataset.editId = id || "";
 
-  qsa("[data-close-modal]", modal).forEach((btn) => {
-    btn.onclick = () => modal.classList.add("hidden");
+  qsa("[data-close-modal]", modal).forEach((b) => {
+    b.onclick = () => modal.classList.add("hidden");
   });
   qs(".modal-backdrop", modal).onclick = () => modal.classList.add("hidden");
 }
 
-function handleEditFormSubmit(ev) {
-  ev.preventDefault();
-  const form = ev.target;
+function handleEditFormSubmit(e) {
+  e.preventDefault();
 
-  const formData = new FormData(form);
-  const data = Object.fromEntries(formData.entries());
+  const form = e.target;
+  const data = Object.fromEntries(new FormData(form).entries());
 
-  const eventObj = {
+  const obj = {
     type: data.type,
     owner: data.owner,
     title: data.title,
@@ -833,44 +713,38 @@ function handleEditFormSubmit(ev) {
     urgency: data.urgency || "none"
   };
 
-  const dateKey = eventObj.dateKey || "undated";
-  const existingId = form.dataset.editId || null;
+  const dk = obj.dateKey;
+  const id = form.dataset.editId;
 
-  if (existingId) {
-    const refPath = ref(db, `events/${dateKey}/${existingId}`);
-    update(refPath, eventObj);
+  if (id) {
+    update(ref(db, `events/${dk}/${id}`), obj);
   } else {
-    const refPath = ref(db, `events/${dateKey}`);
-    const newRef = push(refPath);
-    set(newRef, { ...eventObj, _id: newRef.key });
+    const newRef = push(ref(db, `events/${dk}`));
+    set(newRef, { ...obj, _id: newRef.key });
   }
 
-  scheduleLocalReminder(eventObj);
+  scheduleLocalReminder(obj);
 
   el("editModal").classList.add("hidden");
 }
 
+// --- WAZE ---
 function openWazeFromForm() {
-  const form = el("editForm");
-  const address = form.elements["address"].value;
+  const address = el("editForm").elements["address"].value;
   if (!address) return;
-  const url = `https://waze.com/ul?q=${encodeURIComponent(address)}`;
-  window.open(url, "_blank");
+  window.open(`https://waze.com/ul?q=${encodeURIComponent(address)}`, "_blank");
 }
 
-async function fetchWeatherForDate(date, autoShowIfEmpty) {
+// --- WEATHER FETCH ---
+async function fetchWeatherForDate(date, autoHideIfEmpty) {
   const card = el("dayWeatherContainer");
   const city = getCity();
-  if (!city) {
-    card.classList.add("hidden");
-    return;
-  }
+  if (!city) return card.classList.add("hidden");
 
   try {
     await ensureCityCoords();
   } catch (e) {
-    console.error("City geocode failed", e);
-    el("dayWeatherTemp").textContent = "שגיאה בזיהוי עיר";
+    el("dayWeatherTemp").textContent = "שגיאה בעיר";
     el("dayWeatherDesc").textContent = "";
     el("dayWeatherExtra").textContent = "";
     card.classList.remove("hidden");
@@ -880,581 +754,257 @@ async function fetchWeatherForDate(date, autoShowIfEmpty) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
-  const dayStr = `${y}-${m}-${d}`;
 
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${
     state.settings.cityLat
-  }&longitude=${
-    state.settings.cityLon
-  }&hourly=temperature_2m,precipitation_probability,weather_code&timezone=${encodeURIComponent(
-    state.settings.cityTz || "auto"
-  )}&start_date=${dayStr}&end_date=${dayStr}`;
+  }&longitude=${state.settings.cityLon}&hourly=temperature_2m,precipitation_probability,weather_code&timezone=${
+    state.settings.cityTz
+  }&start_date=${y}-${m}-${d}&end_date=${y}-${m}-${d}`;
+
   try {
     const resp = await fetch(url);
     const data = await resp.json();
+
     if (!data.hourly || !data.hourly.temperature_2m || !data.hourly.temperature_2m.length) {
-      if (autoShowIfEmpty) card.classList.add("hidden");
+      if (autoHideIfEmpty) return card.classList.add("hidden");
       return;
     }
-    // לקחת את השעה 12:00
-    const idx = data.hourly.time.findIndex((t) => t.endsWith("12:00"));
-    const i = idx >= 0 ? idx : 0;
-    const temp = Math.round(data.hourly.temperature_2m[i]);
-    const code = data.hourly.weather_code[i];
-    const rain = data.hourly.precipitation_probability[i];
+
+    let idx = data.hourly.time.findIndex((t) => t.endsWith("12:00"));
+    if (idx < 0) idx = 0;
+
+    const temp = Math.round(data.hourly.temperature_2m[idx]);
+    const rain = data.hourly.precipitation_probability[idx];
+    const code = data.hourly.weather_code[idx];
 
     const mapped = mapOpenMeteoWeather(code);
 
     el("dayWeatherTemp").textContent = `${temp}°C`;
     el("dayWeatherDesc").textContent = `${mapped.emoji} ${mapped.label}`;
-    el("dayWeatherExtra").textContent = rain != null ? `סיכוי למשקעים: ${rain}%` : "";
+    el("dayWeatherExtra").textContent = `סיכוי למשקעים: ${rain}%`;
+
     card.classList.remove("hidden");
-  } catch (err) {
-    console.error(err);
-    if (!autoShowIfEmpty) {
-      el("dayWeatherTemp").textContent = "שגיאה בטעינת מזג האוויר";
-      el("dayWeatherDesc").textContent = "";
-      el("dayWeatherExtra").textContent = "";
-      card.classList.remove("hidden");
-    }
-  }
-}
-
-// לא משתמשים בזה יותר – אבל משאיר אם משהו יקרא
-function pickWeatherEmoji(data) {
-  const id = data.weather[0]?.id || 800;
-  if (id >= 200 && id < 300) return "⛈️";
-  if (id >= 300 && id < 600) return "🌧️";
-  if (id >= 600 && id < 700) return "❄️";
-  if (id >= 700 && id < 800) return "🌫️";
-  if (id === 800) return "☀️";
-  if (id > 800) return "⛅";
-  return "🌤️";
-}
-
-function initBottomNav() {
-  const btns = qsa(".bottom-nav .nav-btn");
-  btns.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      btns.forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-
-      const targetId = btn.dataset.target;
-      qsa(".screen").forEach((s) => s.classList.remove("active"));
-      el(targetId).classList.add("active");
-    });
-  });
-}
-
-function initTasksFilters() {
-  const btns = qsa("#tasksSection .segmented-btn");
-  btns.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      btns.forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      const filter = btn.dataset.filter;
-      renderTasks(filter);
-    });
-  });
-}
-
-function initShopping() {
-  const listTabs = qsa("#shoppingSection .segmented-btn");
-  listTabs.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      listTabs.forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      renderShoppingList();
-    });
-  });
-
-  el("btnAddShopping").onclick = addShoppingItem;
-}
-
-function addShoppingItem() {
-  const input = el("shoppingInput");
-  const text = input.value.trim();
-  if (!text) return;
-
-  const listKey = getCurrentShoppingListKey();
-  const refPath = ref(db, `shopping/${listKey}`);
-  const newRef = push(refPath);
-  set(newRef, {
-    text,
-    completed: false
-  });
-
-  input.value = "";
-}
-
-function getCurrentShoppingListKey() {
-  const active = qs("#shoppingSection .segmented-btn.active");
-  return active ? active.dataset.list || "default" : "default";
-}
-
-function renderShoppingList() {
-  const ul = el("shoppingList");
-  ul.innerHTML = "";
-
-  const listKey = getCurrentShoppingListKey();
-  const itemsObj = state.cache.shopping[listKey] || {};
-  const entries = Object.entries(itemsObj);
-
-  entries.forEach(([id, item]) => {
-    const li = document.createElement("li");
-    li.className = "shopping-item";
-    if (item.completed) li.classList.add("completed");
-
-    const label = document.createElement("span");
-    label.textContent = item.text;
-
-    const toggleBtn = document.createElement("button");
-    toggleBtn.className = "ghost-pill small";
-    toggleBtn.textContent = item.completed ? "בטל ✔" : "✔";
-    toggleBtn.onclick = () => {
-      const refPath = ref(db, `shopping/${listKey}/${id}`);
-      update(refPath, { completed: !item.completed });
-    };
-
-    const deleteBtn = document.createElement("button");
-    deleteBtn.className = "ghost-pill small";
-    deleteBtn.textContent = "🗑";
-    deleteBtn.onclick = () => {
-      const refPath = ref(db, `shopping/${listKey}/${id}`);
-      remove(refPath);
-    };
-
-    li.appendChild(label);
-    li.appendChild(toggleBtn);
-    li.appendChild(deleteBtn);
-
-    ul.appendChild(li);
-  });
-}
-
-function initFirebaseListeners() {
-  const eventsRef = ref(db, "events");
-  onValue(eventsRef, (snap) => {
-    const val = snap.val() || {};
-    state.cache.events = val;
-    renderCalendar();
-    renderTasks();
-    updateStats();
-  });
-
-  const shoppingRef = ref(db, "shopping");
-  onValue(shoppingRef, (snap) => {
-    state.cache.shopping = snap.val() || {};
-    renderShoppingList();
-  });
-
-  const settingsRef = ref(db, "settings");
-  onValue(settingsRef, (snap) => {
-    const settings = snap.val() || {};
-    state.settings.city = settings.city || null;
-    state.settings.cityLat = settings.cityLat || null;
-    state.settings.cityLon = settings.cityLon || null;
-    state.settings.cityTz = settings.cityTz || null;
-
-    el("cityLabel").textContent = state.settings.city || "לא נבחרה";
-    el("settingsCityInput").value = state.settings.city || "";
-  });
-}
-
-async function saveCitySettings() {
-  const city = el("settingsCityInput").value.trim();
-  state.settings.city = city || null;
-  el("cityLabel").textContent = city || "לא נבחרה";
-  const settingsRef = ref(db, "settings");
-  // לשמור גם קואורדינטות
-  try {
-    if (state.settings.city) {
-      await geocodeCity(state.settings.city);
-    }
-    update(settingsRef, {
-      city: state.settings.city,
-      cityLat: state.settings.cityLat || null,
-      cityLon: state.settings.cityLon || null,
-      cityTz: state.settings.cityTz || null
-    });
   } catch (e) {
-    console.error("Failed to save city settings", e);
-    update(settingsRef, { city: state.settings.city });
+    el("dayWeatherTemp").textContent = "שגיאה במזג אוויר";
+    el("dayWeatherDesc").textContent = "";
+    el("dayWeatherExtra").textContent = "";
+    card.classList.remove("hidden");
   }
 }
 
-function toggleHolidayForToday() {
-  const today = new Date();
-  const key = dateKeyFromDate(today);
-  const holidayRef = ref(db, `days/${key}/holiday`);
+// --- GIHARI TOOLS ---
+function appendGihariLog(html) {
+  const enhanced = wrapGihariHumor(html);
+  const log = el("gihariLog");
 
-  onValue(
-    holidayRef,
-    (snap) => {
-      const current = snap.val();
-      if (current) {
-        remove(holidayRef);
-      } else {
-        set(holidayRef, true);
-      }
-    },
-    { onlyOnce: true }
-  );
+  const div = document.createElement("div");
+  div.className = "gihari-msg";
+  div.innerHTML = enhanced;
+  log.appendChild(div);
+
+  const clean = enhanced.replace(/<[^>]+>/g, "");
+  gihariSpeak(clean);
 }
 
-// --- מצב לילה עם שמירה ב-localStorage ---
-function applyTheme(dark) {
-  state.ui.darkMode = !!dark;
-  document.body.classList.toggle("dark", state.ui.darkMode);
+function logGihariCommand(text) {
   try {
-    localStorage.setItem("bnappDarkMode", state.ui.darkMode ? "1" : "0");
+    const newRef = push(ref(db, "gihariLogs"));
+    set(newRef, { text, ts: Date.now() });
   } catch (e) {}
 }
 
-function toggleTheme() {
-  applyTheme(!state.ui.darkMode);
-}
-
-function initTheme() {
-  let dark = false;
-  try {
-    const saved = localStorage.getItem("bnappDarkMode");
-    if (saved === "1") {
-      dark = true;
-    } else if (saved === "0") {
-      dark = false;
-    } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-      dark = true;
-    }
-  } catch (e) {
-    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-      dark = true;
-    }
-  }
-  applyTheme(dark);
-}
-
-function requestNotifications() {
-  if (!("Notification" in window)) return;
-  Notification.requestPermission().then((perm) => {
-    state.ui.notificationsGranted = perm === "granted";
-  });
-}
-
-function scheduleLocalReminder(ev) {
-  if (!state.ui.notificationsGranted) return;
-  if (!ev.dateKey || !ev.reminderMinutes || !ev.title) return;
-
-  const [h, m] = (ev.startTime || "09:00").split(":").map(Number);
-  const d = parseDateKey(ev.dateKey);
-  d.setHours(h, m, 0, 0);
-  const reminderTime = new Date(d.getTime() - ev.reminderMinutes * 60000);
-  const delay = reminderTime.getTime() - Date.now();
-  if (delay <= 0) return;
-
-  setTimeout(() => {
-    if (Notification.permission === "granted") {
-      new Notification("תזכורת BNAPP", {
-        body: ev.title,
-        tag: `bnapp-${ev.dateKey}-${ev.title}`
-      });
-    }
-  }, Math.min(delay, 2147483647));
-}
-
-function initGihari() {
-  el("btnGihari").onclick = () => openGihariModal();
-  el("btnGihariSuggestNow").onclick = () => gihariSuggestNow();
-  el("btnGihariPlaceTasks").onclick = () => gihariPlaceUndatedTasks();
-}
-
-function openGihariModal() {
-  const modal = el("gihariModal");
-  modal.classList.remove("hidden");
-
-  qsa("[data-close-modal]", modal).forEach((btn) => {
-    btn.onclick = () => modal.classList.add("hidden");
-  });
-  qs(".modal-backdrop", modal).onclick = () => modal.classList.add("hidden");
-
-  const summaryEl = el("gihariSummary");
-
-  const { dailyLoadMinutes, freeSlots } = computeLoadAndFreeSlots(new Date());
-  const loadLabel =
-    dailyLoadMinutes < 180 ? "יום קל" : dailyLoadMinutes < 360 ? "יום בינוני" : "יום עמוס";
-
-  summaryEl.innerHTML = `
-    <p>ג'יחרי בדק את היום שלך.</p>
-    <p>עומס משימות/אירועים היום: <strong>${Math.round(
-      dailyLoadMinutes / 60
-    )} שעות</strong> (${loadLabel}).</p>
-    <p>מספר חלונות זמן פנויים משמעותיים (30+ דק'): <strong>${freeSlots.length}</strong>.</p>
-  `;
-
-  el("gihariLog").innerHTML = "";
-
-  // קול – רמה 1: פקודות פשוטות
-  const micBtn = el("gihariMicBtn");
-  if (micBtn) {
-    micBtn.onclick = () => {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) {
-        alert("הדפדפן לא תומך בזיהוי דיבור");
-        return;
-      }
-      const rec = new SR();
-      rec.lang = "he-IL";
-      rec.interimResults = false;
-      rec.maxAlternatives = 1;
-      rec.start();
-
-      micBtn.disabled = true;
-      micBtn.textContent = "מקשיב...";
-
-      rec.onresult = (e) => {
-        micBtn.disabled = false;
-        micBtn.textContent = "🎤 דבר";
-        const text = (e.results[0][0].transcript || "").trim();
-        handleGihariVoiceCommand(text);
-      };
-      rec.onerror = () => {
-        micBtn.disabled = false;
-        micBtn.textContent = "🎤 דבר";
-      };
-      rec.onend = () => {
-        micBtn.disabled = false;
-        micBtn.textContent = "🎤 דבר";
-      };
-    };
-  }
-}
-
 function computeLoadAndFreeSlots(date) {
-  const dateKey = dateKeyFromDate(date);
-  const events = state.cache.events[dateKey] || {};
-  const busySegments = [];
+  const dk = dateKeyFromDate(date);
+  const events = state.cache.events[dk] || [];
+
+  const busy = [];
 
   Object.values(events).forEach((ev) => {
-    // לא מחשיבים אירועים של משתמש אחר בלבד
     if (ev.owner && ev.owner !== state.currentUser && ev.owner !== "shared") return;
     if (!ev.startTime || !ev.endTime) return;
+
     const [sh, sm] = ev.startTime.split(":").map(Number);
     const [eh, em] = ev.endTime.split(":").map(Number);
-    const startMinutes = sh * 60 + sm;
-    const endMinutes = eh * 60 + em;
-    busySegments.push([startMinutes, endMinutes]);
+
+    const s = sh * 60 + sm;
+    const e = eh * 60 + em;
+    busy.push([s, e]);
   });
 
-  busySegments.sort((a, b) => a[0] - b[0]);
+  busy.sort((a, b) => a[0] - b[0]);
 
-  let merged = [];
-  busySegments.forEach((seg) => {
+  const merged = [];
+  busy.forEach((seg) => {
     if (!merged.length) merged.push(seg);
     else {
       const last = merged[merged.length - 1];
-      if (seg[0] <= last[1]) {
-        last[1] = Math.max(last[1], seg[1]);
-      } else {
-        merged.push(seg);
-      }
+      if (seg[0] <= last[1]) last[1] = Math.max(last[1], seg[1]);
+      else merged.push(seg);
     }
   });
 
   let totalBusy = 0;
-  merged.forEach((seg) => {
-    totalBusy += seg[1] - seg[0];
-  });
+  merged.forEach((s) => (totalBusy += s[1] - s[0]));
 
-  const freeSlots = [];
-  const dayStart = 8 * 60;
-  const dayEnd = 22 * 60;
+  const free = [];
+  let cursor = 8 * 60;
+  const end = 22 * 60;
 
-  let cursor = dayStart;
   merged.forEach((seg) => {
-    if (seg[0] - cursor >= 30) {
-      freeSlots.push([cursor, seg[0]]);
-    }
+    if (seg[0] - cursor >= 30) free.push([cursor, seg[0]]);
     cursor = Math.max(cursor, seg[1]);
   });
-  if (dayEnd - cursor >= 30) {
-    freeSlots.push([cursor, dayEnd]);
-  }
+  if (end - cursor >= 30) free.push([cursor, end]);
 
-  return { dailyLoadMinutes: totalBusy, freeSlots };
+  return {
+    dailyLoadMinutes: totalBusy,
+    freeSlots: free
+  };
 }
 
-
-
-function formatMinutesRange(start, end) {
-  const sh = String(Math.floor(start / 60)).padStart(2, "0");
-  const sm = String(start % 60).padStart(2, "0");
-  const eh = String(Math.floor(end / 60)).padStart(2, "0");
-  const em = String(end % 60).padStart(2, "0");
+function formatMinutesRange(s, e) {
+  const sh = String(Math.floor(s / 60)).padStart(2, "0");
+  const sm = String(s % 60).padStart(2, "0");
+  const eh = String(Math.floor(e / 60)).padStart(2, "0");
+  const em = String(e % 60).padStart(2, "0");
   return `${sh}:${sm}–${eh}:${em}`;
 }
 
 function showFreeTimeForToday() {
-  const today = new Date();
-  const { freeSlots } = computeLoadAndFreeSlots(today);
+  const { freeSlots } = computeLoadAndFreeSlots(new Date());
 
-  if (!freeSlots || !freeSlots.length) {
-    appendGihariLog("להיום כמעט אין חורים – היומן שלך מלא כמו מעלית בבניין ישן. 😅");
-    openGihariModal();
+  if (!freeSlots.length) {
+    appendGihariLog("להיום אין כמעט חורים – אתה עמוס כמו מעלית בבניין ישן 😅");
     return;
   }
 
-  const lines = freeSlots.map(([s, e]) => "• " + formatMinutesRange(s, e));
-  appendGihariLog(
-    "הזמנים הפנויים שלך היום:" + "<br>" + lines.join("<br>")
-  );
-  openGihariModal();
-}
-function gihariSuggestNow() {
-  const now = new Date();
-  const dateKey = dateKeyFromDate(now);
-  const tasksUndone = [];
+  let msg = "הזמנים הפנויים שלך היום:<br>";
+  freeSlots.forEach(([s, e]) => {
+    msg += `• ${formatMinutesRange(s, e)}<br>`;
+  });
 
-  Object.entries(state.cache.events).forEach(([dk, items]) => {
+  appendGihariLog(msg);
+}
+
+// ✔️ FIX — template string תקין, בלי שבירה
+function gihariSuggestNow() {
+  const today = new Date();
+  const dk = dateKeyFromDate(today);
+
+  const list = [];
+
+  Object.entries(state.cache.events).forEach(([key, items]) => {
     Object.entries(items).forEach(([id, ev]) => {
       if (ev.type !== "task") return;
-      if (ev.dateKey && ev.dateKey !== dateKey) return;
-      tasksUndone.push({ id, dateKey: dk, ...ev });
+      if (ev.dateKey !== dk) return;
+      list.push({ id, dateKey: dk, ...ev });
     });
   });
 
-  if (!tasksUndone.length) {
-    appendGihariLog("אין משימות להיום. תהנה מהזמן הפנוי שלך 🙌");
+  if (!list.length) {
+    appendGihariLog("אין לך משימות להיום 🙌");
     return;
   }
 
-  const urgencyScore = { today: 3, week: 2, month: 1, none: 0 };
+  const urgScore = { today: 3, week: 2, month: 1, none: 0 };
 
-  tasksUndone.sort((a, b) => {
-    const ua = urgencyScore[a.urgency] || 0;
-    const ub = urgencyScore[b.urgency] || 0;
-    if (ua !== ub) return ub - ua;
-    const da = a.duration || 30;
-    const db = b.duration || 30;
-    return db - da;
-  });
+  list.sort((a, b) => (urgScore[b.urgency] || 0) - (urgScore[a.urgency] || 0));
 
-  const top = tasksUndone[0];
+  const top = list[0];
   appendGihariLog(
-    `מומלץ לעבוד עכשיו על "<strong>${top.title}</strong>" (דחיפות: ${
+    `ממליץ עכשיו לטפל ב־"<strong>${top.title}</strong>" (דחיפות: ${
       top.urgency || "לא דחוף"
-    }, משך משוער: ${top.duration || 30} דק').`
+    })`
   );
 }
 
 function gihariPlaceUndatedTasks() {
-  const undatedTasks = [];
+  appendGihariLog("הפיצ'ר בבנייה… 😉");
+}
 
-  Object.entries(state.cache.events).forEach(([dateKey, items]) => {
-    Object.entries(items).forEach(([id, ev]) => {
-      if (ev.type !== "task") return;
-      if (ev.dateKey && ev.dateKey !== "undated") return;
-      undatedTasks.push({ id, dateKey, ...ev });
-    });
-  });
+// --- COMMAND PARSER ---
+function handleGihariVoiceCommand(text) {
+  if (!text) return;
 
-  if (!undatedTasks.length) {
-    appendGihariLog("אין משימות ללא תאריך לשיבוץ. 😌");
+  logGihariCommand(text);
+
+  text = text.replace(/[.,]/g, " ");
+
+  if (text.includes("תוסיף לי")) {
+    createEventFromGihari(text);
     return;
   }
 
-  const today = new Date();
-  const maxDaysAhead = 14;
-
-  undatedTasks.forEach((task) => {
-    const daysToSearch =
-      task.urgency === "today"
-        ? 0
-        : task.urgency === "week"
-        ? 7
-        : task.urgency === "month"
-        ? 14
-        : maxDaysAhead;
-
-    let placed = false;
-    for (let offset = 0; offset <= daysToSearch; offset++) {
-      const d = new Date(today);
-      d.setDate(d.getDate() + offset);
-      const { freeSlots } = computeLoadAndFreeSlots(d);
-      const duration = task.duration || 30;
-
-      const suitableSlot = freeSlots.find(
-        ([start, end]) => end - start >= duration && start >= 8 * 60 && end <= 22 * 60
-      );
-      if (suitableSlot) {
-        const startMinutes = suitableSlot[0];
-        const startH = String(Math.floor(startMinutes / 60)).padStart(2, "0");
-        const startM = String(startMinutes % 60).padStart(2, "0");
-        const endMinutes = startMinutes + duration;
-        const endH = String(Math.floor(endMinutes / 60)).padStart(2, "0");
-        const endM = String(endMinutes % 60).padStart(2, "0");
-
-        const dk = dateKeyFromDate(d);
-        const refPath = ref(db, `events/${dk}`);
-        const newRef = push(refPath);
-        set(newRef, {
-          ...task,
-          dateKey: dk,
-          startTime: `${startH}:${startM}`,
-          endTime: `${endH}:${endM}`,
-          _id: newRef.key
-        });
-
-        if (task.dateKey && task.dateKey !== "undated") {
-          const oldRef = ref(db, `events/${task.dateKey}/${task.id}`);
-          remove(oldRef);
-        }
-
-        appendGihariLog(
-          `המשימה "<strong>${task.title}</strong>" שובצה ל־${d.toLocaleDateString(
-            "he-IL"
-          )} בשעה ${startH}:${startM}.`
-        );
-
-        placed = true;
-        break;
-      }
-    }
-
-    if (!placed) {
-      appendGihariLog(
-        `לא נמצא חלון זמן מתאים למשימה "<strong>${task.title}</strong>" בשבוע–שבועיים הקרובים.`
-      );
-    }
-  });
-}
-
-function appendGihariLog(html) {
-  const enhanced = wrapGihariHumor(html);
-  const log = el("gihariLog");
-  const msg = document.createElement("div");
-  msg.className = "gihari-msg";
-  msg.innerHTML = enhanced;
-  log.appendChild(msg);
-
-  // ג'יחרי מדבר – אבל לא מקריא מילה במילה את מה שאתה אמרת, אלא רק את המסר שלו
-  const plain = enhanced.replace(/<[^>]+>/g, "");
-  gihariSpeak(plain);
-}
-
-// לוג לפקודות של ג'יחרי – "שיזכור הכל"
-function logGihariCommand(text) {
-  try {
-    const logRef = ref(db, "gihariLogs");
-    const newRef = push(logRef);
-    set(newRef, {
-      text,
-      ts: Date.now()
-    });
-  } catch (e) {
-    console.warn("failed to log gihari command", e);
+  if (text.includes("מתי יש לי זמן")) {
+    showFreeTimeForToday();
+    return;
   }
+
+  appendGihariLog("לא לגמרי הבנתי, נסה לנסח שוב 😅");
 }
 
+function parseCommandTargetDate(text) {
+  const d = new Date();
+  if (text.includes("מחר")) {
+    d.setDate(d.getDate() + 1);
+  } else if (text.includes("בעוד שבוע")) {
+    d.setDate(d.getDate() + 7);
+  }
+  return d;
+}
+
+function parseCommandHour(text) {
+  const m = text.match(/בשעה\s*([0-9]{1,2})/);
+  if (m) return Number(m[1]);
+  return 17;
+}
+
+function createEventFromGihari(text) {
+  const date = parseCommandTargetDate(text);
+
+  const hour = parseCommandHour(text);
+  const startH = String(hour).padStart(2, "0");
+  const endH = String(Math.min(hour + 2, 23)).padStart(2, "0");
+
+  let title = "אירוע";
+  let address = "";
+
+  const idx = text.indexOf("תוסיף לי");
+  if (idx >= 0) {
+    let after = text.slice(idx + "תוסיף לי".length).trim();
+    const bIdx = after.indexOf(" ב");
+    if (bIdx >= 0) {
+      title = after.slice(0, bIdx).trim();
+      address = after.slice(bIdx + 1).trim();
+    } else {
+      title = after.trim();
+    }
+  }
+
+  const dk = dateKeyFromDate(date);
+  const refPath = ref(db, `events/${dk}`);
+  const newRef = push(refPath);
+
+  set(newRef, {
+    type: "event",
+    owner: state.currentUser,
+    title,
+    dateKey: dk,
+    startTime: `${startH}:00`,
+    endTime: `${endH}:00`,
+    duration: (endH - startH) * 60,
+    address,
+    urgency: "none",
+    recurring: "none",
+    _id: newRef.key
+  });
+
+  appendGihariLog(
+    `קבעתי אירוע "<strong>${title}</strong>" ב־${dk} בשעה ${startH}:00`
+  );
+}
+
+// --- CHARTS ---
 let workFreeChart, tasksChart;
 
 function updateStats() {
@@ -1464,6 +1014,7 @@ function updateStats() {
   const freeHours = Math.max(0, 14 - workHours);
 
   const ctx1 = el("workFreeChart").getContext("2d");
+
   if (!workFreeChart) {
     workFreeChart = new Chart(ctx1, {
       type: "doughnut",
@@ -1474,15 +1025,6 @@ function updateStats() {
             data: [workHours, freeHours]
           }
         ]
-      },
-      options: {
-        responsive: true,
-        plugins: {
-          legend: {
-            display: true,
-            position: "bottom"
-          }
-        }
       }
     });
   } else {
@@ -1490,124 +1032,272 @@ function updateStats() {
     workFreeChart.update();
   }
 
-  const last30Days = [];
-  const todayCopy = new Date(today);
+  const arr = [];
   for (let i = 29; i >= 0; i--) {
-    const d = new Date(todayCopy);
+    const d = new Date();
     d.setDate(d.getDate() - i);
-    const { dailyLoadMinutes: dlm } = computeLoadAndFreeSlots(d);
-    last30Days.push({
-      label: d.getDate(),
-      loadHours: dlm / 60
-    });
+    const { dailyLoadMinutes } = computeLoadAndFreeSlots(d);
+    arr.push({ label: d.getDate(), hours: dailyLoadMinutes / 60 });
   }
 
   const ctx2 = el("tasksChart").getContext("2d");
+
   if (!tasksChart) {
     tasksChart = new Chart(ctx2, {
       type: "bar",
       data: {
-        labels: last30Days.map((d) => d.label),
+        labels: arr.map((x) => x.label),
         datasets: [
           {
             label: "עומס יומי (שעות)",
-            data: last30Days.map((d) => d.loadHours)
+            data: arr.map((x) => x.hours)
           }
         ]
-      },
-      options: {
-        responsive: true,
-        scales: {
-          y: {
-            beginAtZero: true
-          }
-        }
       }
     });
   } else {
-    tasksChart.data.labels = last30Days.map((d) => d.label);
-    tasksChart.data.datasets[0].data = last30Days.map((d) => d.loadHours);
+    tasksChart.data.labels = arr.map((x) => x.label);
+    tasksChart.data.datasets[0].data = arr.map((x) => x.hours);
     tasksChart.update();
   }
 }
 
-// --- עזרה לפענוח פקודות זמן פשוטות לג'יחרי ---
-function parseCommandTargetDate(text) {
-  const base = new Date();
-  const d = new Date(base);
-
-  if (text.includes("מחר")) {
-    d.setDate(d.getDate() + 1);
-  } else if (text.includes("בעוד שבוע")) {
-    d.setDate(d.getDate() + 7);
-  } else if (text.includes("בעוד יומיים")) {
-    d.setDate(d.getDate() + 2);
-  }
-  // אם לא מצאנו – נשאר היום
-  return d;
+// --- THEME ---
+function applyTheme(dark) {
+  state.ui.darkMode = !!dark;
+  document.body.classList.toggle("dark", dark);
+  localStorage.setItem("bnappDarkMode", dark ? "1" : "0");
 }
 
-function parseCommandHour(text) {
-  // בשעה 17 / בשעה 5
-  const mNum = text.match(/בשעה\s*([0-9]{1,2})/);
-  let h = null;
-  if (mNum) {
-    h = parseInt(mNum[1], 10);
-  } else if (text.includes("חמש")) {
-    h = 5;
-  }
-  if (h == null) return null;
-
-  if ((text.includes("אחר הצהריים") || text.includes("בערב")) && h < 12) {
-    h += 12;
-  }
-  return h;
+function toggleTheme() {
+  applyTheme(!state.ui.darkMode);
 }
 
-function createEventFromGihari(text) {
-  const targetDate = parseCommandTargetDate(text);
-  const hour = parseCommandHour(text) ?? 17;
-  const startH = String(hour).padStart(2, "0");
-  const startM = "00";
-  const endHour = Math.min(hour + 2, 23);
-  const endH = String(endHour).padStart(2, "0");
+function initTheme() {
+  const saved = localStorage.getItem("bnappDarkMode");
+  if (saved === "1") applyTheme(true);
+  else if (saved === "0") applyTheme(false);
+  else applyTheme(window.matchMedia("(prefers-color-scheme: dark)").matches);
+}
 
-  let title = "אירוע";
-  let address = "";
+// --- CITY SETTINGS ---
+async function saveCitySettings() {
+  const city = el("settingsCityInput").value.trim();
+  state.settings.city = city || null;
+  el("cityLabel").textContent = city || "לא נבחרה";
 
-  const addIdx = text.indexOf("תוסיף לי");
-  if (addIdx >= 0) {
-    let after = text.slice(addIdx + "תוסיף לי".length).trim();
-    const beIdx = after.indexOf(" ב");
-    if (beIdx >= 0) {
-      title = after.slice(0, beIdx).trim();
-      address = after.slice(beIdx + 1).trim();
-    } else {
-      title = after.trim();
-    }
+  const settingsRef = ref(db, "settings");
+
+  try {
+    if (city) await geocodeCity(city);
+    update(settingsRef, {
+      city,
+      cityLat: state.settings.cityLat || null,
+      cityLon: state.settings.cityLon || null,
+      cityTz: state.settings.cityTz || null
+    });
+  } catch (e) {
+    update(settingsRef, { city });
   }
+}
 
-  const dk = dateKeyFromDate(targetDate);
-  const refPath = ref(db, `events/${dk}`);
-  const newRef = push(refPath);
-  set(newRef, {
-    type: "event",
-    owner: state.currentUser,
-    title,
-    description: "",
-    dateKey: dk,
-    startTime: `${startH}:${startM}`,
-    endTime: `${endH}:${startM}`,
-    duration: (endHour - hour) * 60,
-    address,
-    urgency: "none",
-    recurring: "none",
-    _id: newRef.key
+// --- SHOPPING ---
+function initShopping() {
+  const tabs = qsa("#shoppingSection .segmented-btn");
+
+  tabs.forEach((btn) => {
+    btn.onclick = () => {
+      tabs.forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      renderShoppingList();
+    };
   });
 
-  appendGihariLog(
-    `קבעתי לך אירוע "<strong>${title}</strong>" ב־${dk} בשעה ${startH}:${startM}.`
+  el("btnAddShopping").onclick = addShoppingItem;
+}
+
+function getCurrentShoppingListKey() {
+  const act = qs("#shoppingSection .segmented-btn.active");
+  return act ? act.dataset.list : "default";
+}
+
+function addShoppingItem() {
+  const input = el("shoppingInput");
+  const text = input.value.trim();
+  if (!text) return;
+
+  const key = getCurrentShoppingListKey();
+  const r = push(ref(db, `shopping/${key}`));
+  set(r, {
+    text,
+    completed: false
+  });
+
+  input.value = "";
+}
+
+function renderShoppingList() {
+  const ul = el("shoppingList");
+  ul.innerHTML = "";
+
+  const key = getCurrentShoppingListKey();
+  const items = state.cache.shopping[key] || {};
+
+  Object.entries(items).forEach(([id, item]) => {
+    const li = document.createElement("li");
+    li.className = "shopping-item";
+    if (item.completed) li.classList.add("completed");
+
+    const label = document.createElement("span");
+    label.textContent = item.text;
+
+    const checkBtn = document.createElement("button");
+    checkBtn.className = "ghost-pill small";
+    checkBtn.textContent = item.completed ? "בטל ✔" : "✔";
+    checkBtn.onclick = () => {
+      update(ref(db, `shopping/${key}/${id}`), { completed: !item.completed });
+    };
+
+    const del = document.createElement("button");
+    del.className = "ghost-pill small";
+    del.textContent = "🗑";
+    del.onclick = () => remove(ref(db, `shopping/${key}/${id}`));
+
+    li.appendChild(label);
+    li.appendChild(checkBtn);
+    li.appendChild(del);
+
+    ul.appendChild(li);
+  });
+}
+
+// --- FIREBASE LISTENERS ---
+function initFirebaseListeners() {
+  onValue(ref(db, "events"), (snap) => {
+    state.cache.events = snap.val() || {};
+    renderCalendar();
+    renderTasks();
+    updateStats();
+  });
+
+  onValue(ref(db, "shopping"), (snap) => {
+    state.cache.shopping = snap.val() || {};
+    renderShoppingList();
+  });
+
+  onValue(ref(db, "settings"), (snap) => {
+    const s = snap.val() || {};
+    state.settings.city = s.city || null;
+    state.settings.cityLat = s.cityLat || null;
+    state.settings.cityLon = s.cityLon || null;
+    state.settings.cityTz = s.cityTz || null;
+
+    el("cityLabel").textContent = state.settings.city || "לא נבחרה";
+    el("settingsCityInput").value = state.settings.city || "";
+  });
+}
+
+// --- INIT APP ---
+function initBottomNav() {
+  const btns = qsa(".bottom-nav .nav-btn");
+  btns.forEach((b) => {
+    b.onclick = () => {
+      btns.forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      const target = b.dataset.target;
+      qsa(".screen").forEach((s) => s.classList.remove("active"));
+      el(target).classList.add("active");
+    };
+  });
+}
+
+function initTasksFilters() {
+  const btns = qsa("#tasksSection .segmented-btn");
+  btns.forEach((b) => {
+    b.onclick = () => {
+      btns.forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      renderTasks(b.dataset.filter);
+    };
+  });
+}
+
+function requestNotifications() {
+  if (!("Notification" in window)) return;
+  Notification.requestPermission().then((p) => {
+    state.ui.notificationsGranted = p === "granted";
+  });
+}
+
+function toggleHolidayForToday() {
+  const dk = dateKeyFromDate(new Date());
+  const r = ref(db, `days/${dk}/holiday`);
+  onValue(
+    r,
+    (snap) => {
+      if (snap.val()) remove(r);
+      else set(r, true);
+    },
+    { onlyOnce: true }
   );
+}
+
+function openGihariModal() {
+  const modal = el("gihariModal");
+  modal.classList.remove("hidden");
+
+  const { dailyLoadMinutes, freeSlots } = computeLoadAndFreeSlots(new Date());
+  const load =
+    dailyLoadMinutes < 180 ? "יום קל" : dailyLoadMinutes < 360 ? "יום בינוני" : "יום עמוס";
+
+  el("gihariSummary").innerHTML = `
+    <p>עומס להיום: <strong>${Math.round(dailyLoadMinutes / 60)} שעות</strong> (${load})</p>
+    <p>חלונות פנויים: ${freeSlots.length}</p>
+  `;
+
+  el("gihariLog").innerHTML = "";
+
+  qsa("[data-close-modal]", modal).forEach((b) => {
+    b.onclick = () => modal.classList.add("hidden");
+  });
+  qs(".modal-backdrop", modal).onclick = () => modal.classList.add("hidden");
+}
+
+function initGihari() {
+  el("btnGihari").onclick = () => openGihariModal();
+  el("btnGihariSuggestNow").onclick = () => gihariSuggestNow();
+  el("btnGihariPlaceTasks").onclick = () => gihariPlaceUndatedTasks();
+
+  const mic = el("gihariMicBtn");
+  if (mic) {
+    mic.onclick = () => {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SR) {
+        alert("הדפדפן לא תומך בדיבור");
+        return;
+      }
+      const r = new SR();
+      r.lang = "he-IL";
+      r.start();
+      mic.disabled = true;
+      mic.textContent = "מקשיב…";
+
+      r.onresult = (ev) => {
+        mic.disabled = false;
+        mic.textContent = "🎤 דבר";
+        const txt = (ev.results[0][0].transcript || "").trim();
+        handleGihariVoiceCommand(txt);
+      };
+      r.onerror = () => {
+        mic.disabled = false;
+        mic.textContent = "🎤 דבר";
+      };
+      r.onend = () => {
+        mic.disabled = false;
+        mic.textContent = "🎤 דבר";
+      };
+    };
+  }
 }
 
 function initApp() {
@@ -1630,11 +1320,13 @@ function initApp() {
     state.currentDate = new Date();
     renderCalendar();
   };
+
+  // כפתור זמן חופשי (נוסף)
+  el("btnFreeTimeHeader").onclick = () => showFreeTimeForToday();
+
   el("btnFabAdd").onclick = () => openEditModal({});
   el("btnAddTask").onclick = () => openEditModal({});
-  el("btnCity").onclick = () => {
-    qs('[data-target="settingsSection"]').click();
-  };
+  el("btnCity").onclick = () => qs('[data-target="settingsSection"]').click();
   el("btnSaveCity").onclick = saveCitySettings;
   el("btnToggleHoliday").onclick = toggleHolidayForToday;
   el("btnThemeToggle").onclick = toggleTheme;
@@ -1650,150 +1342,4 @@ function initApp() {
 
 document.addEventListener("DOMContentLoaded", initApp);
 
-// --- Gihari advanced voice handler (override) ---
-function handleGihariVoiceCommand(text) {
-  if (!text) return;
-  text = text.replace(/[.,]/g, " ").trim();
-
-  logGihariCommand(text);
-
-  // פתיחת אירוע/משימה בתאריך (רק פותח חלון עריכה)
-  if (text.includes("תפתח") || text.includes("תיצור") || text.includes("תכניס")) {
-    let targetDate = new Date(state.currentDate);
-    if (text.includes("למחר")) {
-      targetDate.setDate(targetDate.getDate() + 1);
-    } else if (text.includes("לשבוע הבא")) {
-      targetDate.setDate(targetDate.getDate() + 7);
-    } else {
-      const m = text.match(/ל([0-9]{1,2})[\.\/-]([0-9]{1,2})[\.\/-]([0-9]{2,4})/);
-      if (m) {
-        const d = parseInt(m[1], 10);
-        const mo = parseInt(m[2], 10) - 1;
-        const y = m[3].length === 2 ? 2000 + parseInt(m[3], 10) : parseInt(m[3], 10);
-        targetDate = new Date(y, mo, d);
-      }
-    }
-    const dk = dateKeyFromDate(targetDate);
-    openEditModal({ dateKey: dk });
-    appendGihariLog("פתחתי חלונית אירוע/משימה לתאריך " + dk);
-    return;
-  }
-
-  // יצירת אירוע אמיתי – לדוגמה: "בעוד שבוע ביום שני בשעה חמש אחר הצהריים תוסיף לי הופעה של פאר טסי בקיסריה"
-  if (text.includes("תוסיף לי")) {
-    createEventFromGihari(text);
-    return;
-  }
-
-  // "מתי יש לי זמן ..." עם משך מסוים
-  if (text.includes("מתי יש לי זמן")) {
-    let hours = 1;
-    const hMatch = text.match(/([א-ת0-9]+)\s*שעה/);
-    if (hMatch) {
-      const word = hMatch[1];
-      const map = { "חצי": 0.5, "שעה": 1, "שעתיים": 2, "שתיים": 2, "שלוש": 3, "ארבע": 4 };
-      if (map[word] != null) hours = map[word];
-      else if (!isNaN(parseFloat(word))) hours = parseFloat(word);
-    }
-    const duration = Math.round(hours * 60);
-    const today = new Date();
-    const suggestions = [];
-    for (let offset = 0; offset <= 14; offset++) {
-      const d = new Date(today);
-      d.setDate(d.getDate() + offset);
-      const { freeSlots } = computeLoadAndFreeSlots(d);
-      for (const [start, end] of freeSlots) {
-        if (end - start >= duration && start >= 8 * 60 && end <= 23 * 60) {
-          suggestions.push({ date: new Date(d), start });
-          if (suggestions.length >= 3) break;
-        }
-      }
-      if (suggestions.length >= 3) break;
-    }
-    if (!suggestions.length) {
-      appendGihariLog("לא מצאתי חלונות זמן מתאימים בשבועיים הקרובים.");
-      return;
-    }
-    let msg = "מצאתי אפשרויות זמן עבורך:\n";
-    suggestions.forEach((opt, idx) => {
-      const dk = dateKeyFromDate(opt.date);
-      const h = String(Math.floor(opt.start / 60)).padStart(2, "0");
-      const m = String(opt.start % 60).padStart(2, "0");
-      msg += `${idx + 1}. ${dk} בשעה ${h}:${m}\n";
-    });
-    appendGihariLog(msg);
-    return;
-  }
-
-  // "אני צריך להתאמן שלוש פעמים השבוע ... כל אימון שלוש שעות"
-  if (text.includes("להתאמן") && text.includes("פעמים") && text.includes("שבוע")) {
-    let times = 3;
-    const timesMatch = text.match(/([א-ת0-9]+)\s*פעמים/);
-    if (timesMatch) {
-      const word = timesMatch[1];
-      const map = { "פעמיים": 2, "שתיים": 2, "שלוש": 3, "ארבע": 4 };
-      if (map[word] != null) times = map[word];
-      else if (!isNaN(parseInt(word, 10))) times = parseInt(word, 10);
-    }
-
-    let hours = 1;
-    const hMatch2 = text.match(/([א-ת0-9]+)\s*שעות?/);
-    if (hMatch2) {
-      const word = hMatch2[1];
-      const map = { "חצי": 0.5, "שעה": 1, "שעתיים": 2, "שתיים": 2, "שלוש": 3 };
-      if (map[word] != null) hours = map[word];
-      else if (!isNaN(parseFloat(word))) hours = parseFloat(word);
-    }
-    const duration = Math.round(hours * 60);
-
-    const today = new Date();
-    let created = 0;
-    outer: for (let offset = 0; offset <= 7; offset++) {
-      const d = new Date(today);
-      d.setDate(d.getDate() + offset);
-      const { freeSlots } = computeLoadAndFreeSlots(d);
-      for (const [start, end] of freeSlots) {
-        if (end - start >= duration && start >= 8 * 60 && end <= 23 * 60) {
-          const dk = dateKeyFromDate(d);
-          const refPath = ref(db, `events/${dk}`);
-          const newRef = push(refPath);
-          const startH = String(Math.floor(start / 60)).padStart(2, "0");
-          const startM = String(start % 60).padStart(2, "0");
-          const endMinutes = start + duration;
-          const endH = String(Math.floor(endMinutes / 60)).padStart(2, "0");
-          const endM = String(endMinutes % 60).padStart(2, "0");
-          set(newRef, {
-            type: "task",
-            title: "אימון",
-            owner: state.currentUser,
-            dateKey: dk,
-            startTime: `${startH}:${startM}`,
-            endTime: `${endH}:${endM}`,
-            duration,
-            urgency: "week",
-            _id: newRef.key
-          });
-          created++;
-          if (created >= times) break outer;
-        }
-      }
-    }
-    if (created === 0) {
-      appendGihariLog("לא הצלחתי למצוא זמן פנוי לאימונים השבוע.");
-    } else {
-      appendGihariLog(`קבעתי ${created} אימונים בשבוע הקרוב.`);
-      loadMonthEvents();
-    }
-    return;
-  }
-
-  // ברירת מחדל – לא הבין
-  appendGihariLog(
-    "שמעתי מה אמרת, אבל לא לגמרי בטוח מה לעשות עם זה. נסה להגיד למשל: 'תוסיף לי משימה למחר בשמונה בבוקר'."
-  );
-}
-
-// Stub – כדי שלא יהיה Error כשג'יחרי קורא לה
-function loadMonthEvents() {
-  renderCalendar();
-}
+// END OF FILE
