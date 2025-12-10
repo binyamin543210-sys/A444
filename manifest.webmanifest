@@ -1,5 +1,6 @@
 {
   "name": "BNAPP V3.5",
+
   "short_name": "BNAPP",
   "start_url": "/",
   "display": "standalone",
