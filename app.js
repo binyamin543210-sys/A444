@@ -159,6 +159,7 @@ function dayName(date) {
 // --- זמני שבת – cache לפי יום שישי ---
 async function ensureShabbatForWeek(fridayDate) {
   const fridayKey = dateKeyFromDate(fridayDate);
+
   if (state.cache.shabbat[fridayKey]) return state.cache.shabbat[fridayKey];
 
   if (!state.settings.cityLat || !state.settings.cityLon || !state.settings.cityTz) {
@@ -168,28 +169,29 @@ async function ensureShabbatForWeek(fridayDate) {
   const y = fridayDate.getFullYear();
   const m = String(fridayDate.getMonth() + 1).padStart(2, "0");
   const d = String(fridayDate.getDate()).padStart(2, "0");
-  const url = `https://www.hebcal.com/shabbat?cfg=json&latitude=${
-    state.settings.cityLat
-  }&longitude=${state.settings.cityLon}&tzid=${encodeURIComponent(
-    state.settings.cityTz
-  )}&start=${y}-${m}-${d}&end=${y}-${m}-${d}`;
+
+  const url = `https://www.hebcal.com/shabbat?cfg=json&latitude=${state.settings.cityLat}&longitude=${state.settings.cityLon}&tzid=${state.settings.cityTz}&start=${y}-${m}-${d}`;
 
   try {
     const resp = await fetch(url);
     const data = await resp.json();
-    const itemCandles = (data.items || []).find((it) => it.category === "candles");
-    const itemHavdalah = (data.items || []).find((it) => it.category === "havdalah");
+
+    const candle = data.items?.find(i => i.category === "candles");
+    const havdalah = data.items?.find(i => i.category === "havdalah");
+
     const result = {
-      candle: itemCandles ? new Date(itemCandles.date) : null,
-      havdalah: itemHavdalah ? new Date(itemHavdalah.date) : null
+      candle: candle ? new Date(candle.date) : null,
+      havdalah: havdalah ? new Date(havdalah.date) : null
     };
+
     state.cache.shabbat[fridayKey] = result;
     return result;
-  } catch (e) {
-    console.error("Failed loading shabbat times", e);
+  } catch (err) {
+    console.error("Shabbat error", err);
     return null;
   }
 }
+
 
 function formatTimeHM(date) {
   if (!date) return "";
@@ -684,6 +686,15 @@ function renderDayEvents(dateKey) {
     const actions = document.createElement("div");
     actions.className = "task-actions";
 
+    const doneBtn = document.createElement("button");
+    doneBtn.className = "ghost-pill small";
+    doneBtn.textContent = "✔ בוצע";
+    doneBtn.onclick = () => {
+      // סימון ביצוע רלוונטי בעיקר למשימות, אבל טכנית מוחק גם אירוע רגיל
+      const taskLike = { id: ev.id || ev._id, dateKey };
+      markTaskDone(taskLike);
+    };
+
     const editBtn = document.createElement("button");
     editBtn.className = "ghost-pill small";
     editBtn.textContent = "עריכה";
@@ -697,6 +708,7 @@ function renderDayEvents(dateKey) {
       remove(refPath);
     };
 
+    actions.appendChild(doneBtn);
     actions.appendChild(editBtn);
     actions.appendChild(delBtn);
     actions.appendChild(wazeBtn);
