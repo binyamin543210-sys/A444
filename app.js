@@ -699,17 +699,6 @@ function handlePostponeFormSubmit(ev) {
 
 
 
-  const newKey = dateKeyFromDate(newDate);
-  const fromRef = ref(db, `events/${task.dateKey}/${task.id}`);
-  const newRef = ref(db, `events/${newKey}/${task.id}`);
-
-  set(newRef, {
-    ...task,
-    dateKey: newKey
-  });
-  remove(fromRef);
-
-
 function openDayModal(date) {
   const modal = el("dayModal");
   modal.classList.remove("hidden");
