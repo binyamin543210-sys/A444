@@ -1,9 +1,0 @@
-{
-  "name": "BNAPP V3.5",
-  "short_name": "BNAPP",
-  "start_url": "./index.html",
-  "display": "standalone",
-  "background_color": "#111320",
-  "theme_color": "#6366f1",
-  "icons": []
-}
