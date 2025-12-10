@@ -708,7 +708,7 @@ function handlePostponeFormSubmit(ev) {
     dateKey: newKey
   });
   remove(fromRef);
-}
+
 
 function openDayModal(date) {
   const modal = el("dayModal");
